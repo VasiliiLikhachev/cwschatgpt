@@ -4,7 +4,12 @@
   "description": "Highlights the ChatGPT tab when a response is ready.",
   "version": "1.0.0",
   "permissions": ["tabs"],
-  "host_permissions": ["https://chat.openai.com/*"],
+
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+
   "background": {
     "service_worker": "background.js"
   },
@@ -13,7 +18,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chat.openai.com/*"],
+
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+
       "js": ["contentScript.js"],
       "run_at": "document_idle"
     }
