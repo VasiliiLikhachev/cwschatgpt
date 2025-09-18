@@ -1,86 +1,142 @@
-const Status = {
-  IDLE: 'idle',
-  GENERATING: 'generating',
-  READY: 'ready',
-};
+// --- статусы ---
+const Status = { IDLE: 'idle', GENERATING: 'generating', READY: 'ready' };
 
+// --- состояние ---
 let state = Status.IDLE;
-let generationSnapshot = null;
+let snapshot = null;         // { msgCount, lastLen, t }
 let checkScheduled = false;
 
-const scheduleCheck = () => {
-  if (checkScheduled) {
-    return;
-  }
+// --- хелперы ---
+const $  = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
 
+const getAssistantNodes = () => $$('[data-message-author-role="assistant"]');
+const getLastAssistantNode = () => {
+  const nodes = getAssistantNodes();
+  return nodes.length ? nodes[nodes.length - 1] : null;
+};
+const getLastAssistantLength = () => {
+  const n = getLastAssistantNode();
+  return n ? (n.textContent || '').length : 0;
+};
+
+// считаем, что "генерация идет" только если кнопка Stop реально ВИДИМА
+const isGenerating = () => {
+  const el =
+    $('button[data-testid="stop-button"]') ||
+    $('[data-testid="stop-streaming-button"]');
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  const visible =
+    el.offsetParent !== null &&
+    style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    style.opacity !== '0';
+  return visible;
+};
+
+// безопасная отправка сообщений в бэкграунд
+const notify = (status) => {
+  try {
+    if (chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({ type: 'status', status }, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+  } catch (_) {}
+};
+
+const scheduleCheck = () => {
+  if (checkScheduled) return;
   checkScheduled = true;
   requestAnimationFrame(() => {
     checkScheduled = false;
-    evaluateState();
+    evaluate();
   });
 };
 
-const countAssistantMessages = () =>
-  document.querySelectorAll('[data-message-author-role="assistant"]').length;
+// --- ядро ---
+const evaluate = () => {
+  const generatingNow = isGenerating();
 
-const notify = (status) => {
-  chrome.runtime.sendMessage({ type: 'status', status }).catch(() => {
-    // The background service worker might be asleep; ignore errors.
-  });
-};
-
-const evaluateState = () => {
-  const isGeneratingNow = Boolean(
-    document.querySelector('button[data-testid="stop-button"]') ||
-      document.querySelector('[data-testid="stop-streaming-button"]')
-  );
-
-  if (isGeneratingNow) {
+  if (generatingNow) {
     if (state !== Status.GENERATING) {
       state = Status.GENERATING;
-      generationSnapshot = {
-        count: countAssistantMessages(),
-        timestamp: Date.now(),
+      snapshot = {
+        msgCount: getAssistantNodes().length,
+        lastLen:  getLastAssistantLength(),
+        t:        Date.now(),
       };
+      console.log('[GPT Badge] START', snapshot);
       notify(Status.GENERATING);
     }
     return;
   }
 
   if (state === Status.GENERATING) {
-    const currentCount = countAssistantMessages();
-    const hasNewAnswer =
-      !generationSnapshot || currentCount > generationSnapshot.count;
+    const msgCount = getAssistantNodes().length;
+    const lastLen  = getLastAssistantLength();
+
+    console.log('[GPT Badge] CHECK after generation', {
+      prevMsg: snapshot?.msgCount, nowMsg: msgCount,
+      prevLen: snapshot?.lastLen,  nowLen: lastLen
+    });
+
+    const grewByNewMsg = !snapshot || msgCount > snapshot.msgCount;
+    const grewByText   = !snapshot || lastLen  > snapshot.lastLen;
+    const hasNewAnswer = grewByNewMsg || grewByText;
 
     state = hasNewAnswer ? Status.READY : Status.IDLE;
 
     if (hasNewAnswer) {
+      console.log('[GPT Badge] READY');
       notify(Status.READY);
+    } else {
+      console.log('[GPT Badge] no change, stay IDLE');
     }
   }
 };
 
-const observer = new MutationObserver(() => {
-  scheduleCheck();
-});
+// следим за DOM
+const observer = new MutationObserver(scheduleCheck);
+observer.observe(document.documentElement, { childList: true, subtree: true });
 
-observer.observe(document.body, {
-  childList: true,
-  subtree: true,
-});
+console.log('[GPT Badge] content script loaded');
+evaluate();
 
-evaluateState();
-
-window.addEventListener('focus', () => {
+// сброс при возврате к вкладке
+const resetIfViewed = () => {
   if (state === Status.READY) {
     state = Status.IDLE;
-    notify('viewed');
+    console.log('[GPT Badge] VIEWED');
+    try {
+      chrome?.runtime?.id && chrome.runtime.sendMessage({ type: 'status', status: 'viewed' }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (_) {}
   }
+};
+window.addEventListener('focus', resetIfViewed);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') resetIfViewed();
 });
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state === Status.READY) {
-    state = Status.IDLE;
-    notify('viewed');
-  }
-});
+// резервный поллинг — даже если вкладка в фоне
+const POLL_MS = 1000;
+setInterval(() => {
+  try {
+    if (state === Status.GENERATING) evaluate();
+  } catch (_) {}
+}, POLL_MS);
+
+// heartbeat — пока GENERATING, пингуем фон, чтобы не «залипали» точки
+const HEARTBEAT_MS = 2000;
+setInterval(() => {
+  try {
+    if (state === Status.GENERATING && chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({ type: 'heartbeat', status: 'generating' }, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+  } catch (_) {}
+}, HEARTBEAT_MS);
