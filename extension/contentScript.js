@@ -46,6 +46,72 @@ const notify = (status) => {
   } catch (_) {}
 };
 
+// heartbeat-конфигурация и управление
+const HEARTBEAT_VISIBLE_MS = 6000;
+const HEARTBEAT_HIDDEN_MS  = 9000;
+let   heartbeatActive = false;
+let   heartbeatInterval = null;
+
+const getHeartbeatDelay = () => (
+  document.visibilityState === 'hidden' ? HEARTBEAT_HIDDEN_MS : HEARTBEAT_VISIBLE_MS
+);
+
+const sendHeartbeat = () => {
+  if (state !== Status.GENERATING) return;
+  try {
+    if (chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({ type: 'heartbeat', status: 'generating' }, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+  } catch (_) {}
+};
+
+const startHeartbeat = () => {
+  if (heartbeatActive) return;
+  heartbeatActive = true;
+  sendHeartbeat();
+  heartbeatInterval = getHeartbeatDelay();
+  try {
+    if (chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({
+        type: 'heartbeat-control',
+        action: 'start',
+        intervalMs: heartbeatInterval,
+      }, () => { void chrome.runtime.lastError; });
+    }
+  } catch (_) {}
+};
+
+const stopHeartbeat = () => {
+  if (!heartbeatActive) return;
+  heartbeatActive = false;
+  heartbeatInterval = null;
+  try {
+    if (chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({ type: 'heartbeat-control', action: 'stop' }, () => {
+        void chrome.runtime.lastError;
+      });
+    }
+  } catch (_) {}
+};
+
+const updateHeartbeatSchedule = (force = false) => {
+  if (!heartbeatActive || state !== Status.GENERATING) return;
+  const nextInterval = getHeartbeatDelay();
+  if (!force && heartbeatInterval === nextInterval) return;
+  heartbeatInterval = nextInterval;
+  try {
+    if (chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({
+        type: 'heartbeat-control',
+        action: 'update',
+        intervalMs: heartbeatInterval,
+      }, () => { void chrome.runtime.lastError; });
+    }
+  } catch (_) {}
+};
+
 const scheduleCheck = () => {
   if (checkScheduled) return;
   checkScheduled = true;
@@ -69,11 +135,17 @@ const evaluate = () => {
       };
       console.log('[GPT Badge] START', snapshot);
       notify(Status.GENERATING);
+      startHeartbeat();
+    } else if (!heartbeatActive) {
+      startHeartbeat();
+    } else {
+      updateHeartbeatSchedule();
     }
     return;
   }
 
   if (state === Status.GENERATING) {
+    stopHeartbeat();
     const msgCount = getAssistantNodes().length;
     const lastLen  = getLastAssistantLength();
 
@@ -93,6 +165,7 @@ const evaluate = () => {
       notify(Status.READY);
     } else {
       console.log('[GPT Badge] no change, stay IDLE');
+      notify(Status.IDLE);
     }
   }
 };
@@ -119,6 +192,10 @@ const resetIfViewed = () => {
 window.addEventListener('focus', resetIfViewed);
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') resetIfViewed();
+  if (heartbeatActive && state === Status.GENERATING) {
+    if (document.visibilityState === 'hidden') sendHeartbeat();
+    updateHeartbeatSchedule();
+  }
 });
 
 // резервный поллинг — даже если вкладка в фоне
@@ -129,14 +206,12 @@ setInterval(() => {
   } catch (_) {}
 }, POLL_MS);
 
-// heartbeat — пока GENERATING, пингуем фон, чтобы не «залипали» точки
-const HEARTBEAT_MS = 2000;
-setInterval(() => {
-  try {
-    if (state === Status.GENERATING && chrome?.runtime?.id) {
-      chrome.runtime.sendMessage({ type: 'heartbeat', status: 'generating' }, () => {
-        void chrome.runtime.lastError;
-      });
+// слушаем пинги из background, чтобы heartbeat не залипал в фоне
+try {
+  chrome?.runtime?.onMessage?.addListener((msg) => {
+    if (msg?.type === 'heartbeat-ping' && heartbeatActive && state === Status.GENERATING) {
+      sendHeartbeat();
+      updateHeartbeatSchedule();
     }
-  } catch (_) {}
-}, HEARTBEAT_MS);
+  });
+} catch (_) {}
